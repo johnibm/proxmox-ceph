@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# ---- Inputs ----
+MON_IP="${mon_ip}"
+CEPH_RELEASE="${ceph_release}"
+RGW_PORT=${rgw_port}
+REALM="${realm}"
+ZONEGROUP="${zonegroup}"
+ZONE="${zone}"
+RHEL_MAJOR=${rhel_major}
+CEPH_DIST="${ceph_distribution}"
+REGISTRY="${container_registry}"
+IMAGE_REPO="${container_image_repo}"
+IMAGE_TAG="${container_image_tag}"
+REG_USER='${registry_username}'
+REG_PASS='${registry_password}'
+ENABLE_VIP='${enable_rgw_vip}'
+VIP_IP='${rgw_vip_ip}'
+VRID='${keepalived_vrid}'
+ENABLE_CLUSTER='${enable_cluster_network}'
+PUBLIC_NET_CIDR='${public_network_cidr}'
+CLUSTER_NET_CIDR='${cluster_network_cidr}'
+ENABLE_DASHBOARD='${enable_dashboard_monitoring}'
+DASH_USER='${dashboard_admin_user}'
+DASH_PASS='${dashboard_admin_password}'
+
+# Lists (space-separated)
+eval "OSD_HOSTS=(${osd_hosts})"
+eval "OSD_IPS=(${osd_ips})"
+eval "RGW_HOSTS=(${rgw_hosts})"
+eval "RGW_IPS=(${rgw_ips})"
+
+log(){ echo "[bootstrap] $1"; }
+
+# ---- OS prep ----
+PKG_MGR=dnf
+if ! command -v dnf >/dev/null 2>&1 && command -v yum >/dev/null 2>&1; then PKG_MGR=yum; fi
+$PKG_MGR -y install curl podman lvm2 jq python3-policycoreutils openssh-clients || true
+$PKG_MGR -y update -x kernel* || true
+
+# ---- Registry login ----
+if [[ -n "$REG_USER" && -n "$REG_PASS" ]]; then
+  echo -n "$REG_PASS" | podman login "$REGISTRY" --username "$REG_USER" --password-stdin
+fi
+IMAGE_FQN="${REGISTRY}/${IMAGE_REPO}:${IMAGE_TAG}"
+
+# ---- cephadm bootstrap ----
+curl -fsSL https://download.ceph.com/cephadm/cephadm -o /usr/local/bin/cephadm
+chmod +x /usr/local/bin/cephadm
+cephadm add-repo --release "$CEPH_RELEASE"
+cephadm install cephadm
+
+BOOTSTRAP_ARGS=(--mon-ip "$MON_IP" --image "$IMAGE_FQN")
+if [[ "$ENABLE_CLUSTER" == "true" ]]; then
+  BOOTSTRAP_ARGS+=(--cluster-network "$CLUSTER_NET_CIDR")
+fi
+if [[ "$ENABLE_DASHBOARD" != "true" ]]; then
+  BOOTSTRAP_ARGS+=(--skip-monitoring-stack)
+fi
+cephadm bootstrap "${BOOTSTRAP_ARGS[@]}"
+
+# ---- Orchestrator host add ----
+cephadm shell -- ceph cephadm get-pub-key > /root/ceph.pub
+for ip in "${OSD_IPS[@]}" "${RGW_IPS[@]}"; do
+  if [[ "$ip" != "$MON_IP" ]]; then
+    ssh -o StrictHostKeyChecking=no root@"$ip" "mkdir -p /root/.ssh && cat >> /root/.ssh/authorized_keys" < /root/ceph.pub || true
+  fi
+done
+
+for i in "${!OSD_HOSTS[@]}"; do
+  host=${OSD_HOSTS[$i]}; ip=${OSD_IPS[$i]}
+  cephadm shell -- ceph orch host add "$host" "$ip" || true
+  cephadm shell -- ceph orch host label add "$host" osd || true
+  cephadm shell -- ceph orch host label add "$host" mon || true
+  cephadm shell -- ceph orch host label add "$host" mgr || true
+done
+for i in "${!RGW_HOSTS[@]}"; do
+  host=${RGW_HOSTS[$i]}; ip=${RGW_IPS[$i]}
+  cephadm shell -- ceph orch host add "$host" "$ip" || true
+  cephadm shell -- ceph orch host label add "$host" rgw || true
+done
+
+# ---- OSDs ----
+cephadm shell -- ceph orch apply osd --all-available-devices
+
+# ---- Networks + dashboard ----
+cephadm shell -- ceph config set global public_network "$PUBLIC_NET_CIDR"
+if [[ "$ENABLE_CLUSTER" == "true" ]]; then
+  cephadm shell -- ceph config set global cluster_network "$CLUSTER_NET_CIDR"
+fi
+if [[ "$ENABLE_DASHBOARD" == "true" ]]; then
+  cephadm shell -- ceph mgr module enable dashboard || true
+  cephadm shell -- ceph dashboard ac-user-create "$DASH_USER" "$DASH_PASS" administrator ||     cephadm shell -- ceph dashboard ac-user-set-password "$DASH_USER" "$DASH_PASS" || true
+fi
+
+# ---- RGW ----
+cephadm shell -- bash -c "  set -euo pipefail;   radosgw-admin realm create --rgw-realm='${REALM}' --default || true;   radosgw-admin zonegroup create --rgw-zonegroup='${ZONEGROUP}' --master --default || true;   radosgw-admin zone create --rgw-zonegroup='${ZONEGROUP}' --rgw-zone='${ZONE}' --master --default || true;   radosgw-admin period update --commit || true;   ceph orch apply rgw ${REALM}.${ZONE} --placement="count:2 host_pattern=rgw-*" --port ${RGW_PORT} || true "
+
+# ---- Set container image base for cephadm orchestration ----
+cephadm shell -- ceph config set mgr mgr/cephadm/container_image_base "${REGISTRY}/${IMAGE_REPO}"
+
+# ---- HAProxy + Keepalived VIP ----
+if [[ "$ENABLE_VIP" == "true" ]]; then
+  cat > /root/haproxy.cfg <<HAP
+global
+  maxconn 2048
+  log /dev/log local0
+
+defaults
+  log     global
+  mode    http
+  option  httplog
+  option  dontlognull
+  timeout connect 5s
+  timeout client  50s
+  timeout server  50s
+
+frontend s3_front
+  bind *:${RGW_PORT}
+  default_backend s3_back
+
+backend s3_back
+  balance roundrobin
+  option httpchk GET /
+  server rgw1 ${RGW_IPS[0]}:${RGW_PORT} check
+  server rgw2 ${RGW_IPS[1]}:${RGW_PORT} check
+HAP
+
+  cat > /root/keepalived.conf <<KAV
+vrrp_instance VI_1 {
+  state BACKUP
+  interface $(ip -o -4 route show to default | awk '{print $5; exit}')
+  virtual_router_id ${VRID}
+  priority 100
+  advert_int 1
+  authentication {
+    auth_type PASS
+    auth_pass 42secret
+  }
+  virtual_ipaddress {
+    ${VIP_IP}
+  }
+}
+KAV
+
+  for ip in "${RGW_IPS[@]}"; do
+    ssh -o StrictHostKeyChecking=no root@"$ip" bash -c "'
+      set -e
+      if command -v dnf >/dev/null 2>&1; then PM=dnf; else PM=yum; fi
+      $PM -y install haproxy keepalived
+      mkdir -p /etc/haproxy /etc/keepalived
+    '"
+    scp -o StrictHostKeyChecking=no /root/haproxy.cfg root@"$ip":/etc/haproxy/haproxy.cfg
+    scp -o StrictHostKeyChecking=no /root/keepalived.conf root@"$ip":/etc/keepalived/keepalived.conf
+    ssh -o StrictHostKeyChecking=no root@"$ip" bash -c "'
+      systemctl enable --now haproxy
+      systemctl enable --now keepalived
+    '"
+  done
+fi
+
+log "Done. Check: cephadm shell -- ceph -s;
+  Dashboard: https://${MON_IP}:8443 (user: ${DASH_USER})
+  RGW: http://${VIP_IP:-${RGW_IPS[0]}}:${RGW_PORT}"
